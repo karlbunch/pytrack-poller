@@ -2,7 +2,7 @@
 
 The pycom [pytrac](https://pycom.io/product/pytrack/) module comes with a very basic driver for the GPS chip.
 
-The pytrac uses the [L76-L GNSS](http://www.quectel.com/product/l76l.htm) chip for GPS data. This poller leverages the manufacturer's detailed documentation to enable extended features for polling.
+The pytrac uses the [L76-L GNSS](http://www.quectel.com/product/l76l.htm) chip for GPS data. This poller leverages the manufacturer's detailed [documentation](http://www.quectel.com/Qdownload/L76.zip) to enable extended features for polling.
 
 The poller will initialize the chip and track state and output a JSON log record every 10 seconds with the latest state.
 
