@@ -12,17 +12,15 @@ If a SD card is found the poller will also log the json records to files named /
 
 The following extended modes are enabled by this poller:
 
-* Report intervals
-* Query report intervals
-* Set number of decimal points
-* Enable txt messages
-* Enable velocity reporting
-* Enable Return Link messages
-* Enable EASY function
-* Query log status
-* Enable GPS+GLONASS+Galileo+GALILEO_FULL
-* Enable SBAS DGPS Mode
-* Enable searching for SBAS satellites
+* Set report intervals to include ZDA
+* Set number of decimal points to max
+* TXT messages
+* Velocity reporting
+* Return Link messages
+* EASY function
+* GPS+GLONASS+Galileo+GALILEO_FULL
+* SBAS DGPS Mode
+* Searching for SBAS satellites
 
 ## Example log entry:
 
