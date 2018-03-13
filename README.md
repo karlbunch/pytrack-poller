@@ -62,3 +62,9 @@ The following extended modes are enabled by this poller:
     "time": "2018-03-13 10:01:00 UTC"
 }
 ```
+
+## Configuration
+
+If you want to connect via telnet or ftp to the module you should copy config-example.py to config.py and set your SSID and Wifi password.
+
+
