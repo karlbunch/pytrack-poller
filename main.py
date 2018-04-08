@@ -11,17 +11,28 @@ import os
 GPS_I2CADDR = const(0x10)
 
 class GPS_Poller:
+    TIME_MODE_RTC = "RTC"
+    TIME_MODE_GPS_SEARCH = "GPS_SEARCH"
+    TIME_MODE_GPS_INSYNC = "GPS_INSYNC"
+
     def __init__(self, json_output=False):
         pycom.heartbeat(False)
         pycom.rgbled(0x100000)
 
+        self.gps_log = gps_logger()
+        self.state = {}
         self.json_output = json_output
         self.i2c = machine.I2C(0, mode=machine.I2C.MASTER, pins=('P22','P21'))
-        self.gps_log = gps_logger()
         self.py = pytrack.Pytrack()
         self.cmd_queue = []
         self.cmd_wait_for = None
         self.cmd_timeout = None
+        self.time_mode = self.TIME_MODE_RTC
+        self.state["gps_time"] = (1969, 1, 1, 0, 0, 0)
+        self.state["have_fix"] = False
+
+        if time.localtime()[0] < 1981:
+            self.time_mode = self.TIME_MODE_GPS_SEARCH
 
         rtc = machine.RTC()
 
@@ -50,19 +61,24 @@ class GPS_Poller:
         self.queue_cmd("$PMTK313,1") # Enable searching for SBAS satellites
 
     def run(self, log_interval=10):
-        self.state = {}
-        circular_buffer = b""
         self.read_count = 0
+        self.next_log_time = 0
+
+        circular_buffer = b""
         max_buf_len = 0
         max_pkt_len = 0
         last_large_buf = 0
         count_large_buf = 0
-        self.next_log_time = 0
-        heartbeat_colors = [0x080000, 0x000800, 0x000008]
 
         while True:
             self.read_count += 1
-            pycom.rgbled(heartbeat_colors[self.read_count % 3])
+            rgb_color = (self.read_count % 2) * 0x000008
+            if self.state["have_fix"]:
+                rgb_color |= 0x000800
+            else:
+                rgb_color |= 0x080000
+
+            pycom.rgbled(rgb_color)
 
             buf = self.i2c.readfrom(GPS_I2CADDR, 255).lstrip(b"\n").rstrip(b"\n")
 
@@ -133,46 +149,205 @@ class GPS_Poller:
                 time.sleep(0.1)
 
     def parse_pkt(self, pkt):
-            if not "*" in pkt:
+        if not "*" in pkt:
+            return
+
+        try:
+            msg, pkt_chksum = pkt.split('*')
+            pkt_chksum = int(pkt_chksum, 16)
+        except ValueError:
+            self.errlog("split_err", "Split failed: %s" % pkt)
+            return
+
+        if len(msg) == 0:
+            return
+
+        #print("msg(%d)[%s] pkt_chksum(%s): [%s]" % (len(msg), msg, pkt_chksum, pkt))
+
+        msg_chksum = 0
+        ofs = 1 if msg[0] == "$" else 0
+        for ch in msg[ofs:]:
+            msg_chksum ^= ord(ch)
+
+        if msg_chksum != pkt_chksum:
+            self.errlog("chkerr", "Skipping invalid msg_chksum(%x) != pkt_chksum(%x): [%s]" % (msg_chksum, pkt_chksum, pkt))
+            return
+
+        self.check_cmd_response(pkt)
+
+        key = pkt[:pkt.find(",")]
+
+        # Parse some keys out to logical keys
+        try:
+            if len(key) == 6:
+                sub_key = key[3:6]
+
+                if sub_key == "RMC":
+                    self.parse_rmc(pkt)
+                elif sub_key == "ZDA":
+                    self.parse_zda(pkt)
+                elif sub_key == "GLL":
+                    self.parse_gll(pkt)
+
+                if sub_key == "GSV": # Multi-sequence packet
+                    key += "-%s" % pkt.split(",")[2]
+                elif sub_key == "GLL": # Lat/Long "V" (Void) or "A" (Active)
+                    key += "-%s" % pkt.split(",")[-2]
+        except:
+            pass
+
+        self.state[key] = pkt
+
+    def set_gps_time(self, new_time, source):
+        self.errlog("gps_time", "GPS Time {}: {} vs {}".format(source, new_time, time.localtime()))
+
+        if None in new_time:
+            self.state["gps_time"] = (1969, 1, 1, 0, 0, 0)
+        else:
+            self.state["gps_time"] = new_time
+
+            if new_time[0] <= 1980:
                 return
 
-            try:
-                msg, pkt_chksum = pkt.split('*')
-                pkt_chksum = int(pkt_chksum, 16)
-            except ValueError:
-                self.errlog("split_err", "Split failed: %s" % pkt)
+            # Wait for cmd queue to drain
+            if len(self.cmd_queue) > 0:
                 return
 
-            if len(msg) == 0:
-                return
+            self.state["clock_drift"] = abs(time.mktime(new_time[:-1] + (int(new_time[-1]),0,0)) - time.time())
 
-            #print("msg(%d)[%s] pkt_chksum(%s): [%s]" % (len(msg), msg, pkt_chksum, pkt))
+            if self.state["clock_drift"] > 60:
+                try:
+                    ss = new_time[-1]
+                    rtc_tm = new_time[:-1] + (int(ss),int((ss-int(ss))*1000000))
+                    machine.RTC().init(rtc_tm)
+                    self.errlog("rtc_set", "RTC set to {}".format(rtc_tm))
+                except:
+                    pass
 
-            msg_chksum = 0
-            ofs = 1 if msg[0] == "$" else 0
-            for ch in msg[ofs:]:
-                msg_chksum ^= ord(ch)
+    def set_fix(self, fix_time, fix_ll, source):
+        if not self.state["have_fix"]:
+            self.state["fix_start"] = "{} @ {}".format(fix_ll, fix_time)
 
-            if msg_chksum != pkt_chksum:
-                self.errlog("chkerr", "Skipping invalid msg_chksum(%x) != pkt_chksum(%x): [%s]" % (msg_chksum, pkt_chksum, pkt))
-                return
+        self.state["have_fix"] = True
+        self.errlog("last_fix", "{} @ {}".format(fix_ll, fix_time))
 
-            self.check_cmd_response(pkt)
+    def clear_fix(self, source):
+        if self.state["have_fix"]:
+            self.state["have_fix"] = False
+            self.state["fix_end"] = "{} @ {}".format(source, self.read_count)
+            self.errlog("clear_fix", source)
 
-            key = pkt[:pkt.find(",")]
+    def parse_gps_utc(self, hhmmss):
+        try:
+            hh = int(hhmmss[0:2])
+            mm = int(hhmmss[2:4])
+            ss = float(hhmmss[4:])
+            return (hh, mm, ss)
+        except:
+            return (None, None, None)
 
-            # Parse some keys out to logical keys
-            try:
-                if len(key) == 6:
-                    sub_key = key[3:6]
-                    if sub_key == "GSV": # Multi-sequence packet
-                        key += "-%s" % pkt.split(",")[2]
-                    elif sub_key == "GLL": # Lat/Long "V" (Void) or "A" (Active)
-                        key += "-%s" % pkt.split(",")[-2]
-            except:
-                pass
+    def parse_ll_fix(self, ll):
+        """ Parse Lat,Dir,Long,Dir """
+        try:
+            latitude = float(ll[0][0:2]) + float(ll[0][2:]) / 60
 
-            self.state[key] = pkt
+            if ll[1] == "S":
+                latitude *= -1
+
+            longitude = float(ll[2][0:3]) + float(ll[2][3:]) / 60
+
+            if ll[3] == "W":
+                longitude *= -1
+        except:
+            return (None, None)
+
+    def parse_rmc(self, pkt):
+        """
+               0      1          2 3         4 5          6 7    8      9      10 11 12
+        Parse: $GNRMC,142323.000,A,3446.4447,N,11145.9536,W,0.00,206.73,280318,  ,  ,D*6D
+            0	Message ID $GPRMC
+            1	UTC of position fix
+            2	Status A=active or V=void
+            3	Latitude
+            4	Longitude
+            5	Speed over the ground in knots
+            6	Track angle in degrees (True)
+            7	Date
+            8	Magnetic variation in degrees
+            9	The checksum data, always begins with *
+         """
+        fields = pkt.split(',')
+
+        if fields[2] != 'A':
+            self.clear_fix("rmc")
+            return
+
+        try:
+            fix_ll = self.parse_ll_fix(fields[3:6])
+            ddmmyy = fields[9]
+            dd = int(ddmmyy[0:1])
+            mm = int(ddmmyy[2:3])
+            yy = 2000 + int(ddmmyy[4:5])
+            fix_time = self.parse_gps_utc(fields[1])
+            self.set_gps_time((yy, mm, dd) + fix_time, "rmc")
+            self.set_fix(fix_time, fix_ll, "rmc")
+        except:
+            self.errlog("parse_rmc_fail", "Failed to parse: " + pkt)
+
+        return
+
+    def parse_gll(self, pkt):
+        """
+               0      1         2 3          4 5          6 7
+        Parse: $GNGLL,3324.8933,N,11200.4470,W,161732.000,A,A*57
+            0	Message ID $GPGLL
+            1	Latitude in dd mm,mmmm format (0-7 decimal places)
+            2	Direction of latitude N: North S: South
+            3	Longitude in ddd mm,mmmm format (0-7 decimal places)
+            4	Direction of longitude E: East W: West
+            5	UTC of position in hhmmss.ss format
+            6	Fixed text "A" shows that data is valid
+            7	The checksum data, always begins with *
+        """
+        fields = pkt.split(',')
+
+        if fields[6] != 'A':
+            self.clear_fix("gll")
+            return
+
+        try:
+            fix_ll = self.parse_ll_fix(fields[1:4])
+            fix_time = self.parse_gps_utc(fields[5])
+            self.set_gps_time((None, None, None) + fix_time, "gll")
+            self.set_fix(fix_time, fix_ll, "gll")
+        except:
+            self.errlog("parse_gll_fail", "Failed to parse: " + pkt)
+
+    def parse_zda(self, pkt):
+        """
+               0      1          2  3  4    5 6 7
+        Parse: $GNZDA,142323.000,28,03,2018, ,  *4F
+            0	Message ID $GPZDA
+            1	UTC
+            2	Day, ranging between 01 and 31
+            3	Month, ranging between 01 and 12
+            4	Year
+            5	Local time zone offset from GMT, ranging from 00 through ±13 hours
+            6	Local time zone offset from GMT, ranging from 00 through 59 minutes
+            7	The checksum data, always begins with *
+
+        Note: $GNZDA,000507.800,06,01,1980,,*45 - GPS Week 0 - Not valid date
+        """
+        fields = pkt.split(',')
+
+        try:
+            tm = self.parse_gps_utc(fields[1])
+            dd = int(fields[2])
+            mm = int(fields[3])
+            yy = int(fields[4])
+            self.set_gps_time((yy, mm, dd) + tm, "zda")
+        except:
+            self.errlog("parse_zda_fail", "Failed to parse: " + pkt)
 
     def queue_cmd(self, cmd, wait_for=None, timeout=10):
         self.cmd_queue.append((cmd, wait_for, timeout))
@@ -242,11 +417,13 @@ class gps_logger:
         try:
             os.listdir("/sd")
             self.have_SD = True
+            print(">> SD Card already mounted")
         except:
             try:
                 sd = machine.SD()
                 os.mount(sd, "/sd") # pylint: disable=E1101
                 self.have_SD = True
+                print(">> Mounted SD card")
             except:
                 pass
 
@@ -299,4 +476,5 @@ try:
 except:
     pass
 
-print(poller.__dict__)
+if poller:
+    print(poller.__dict__)
