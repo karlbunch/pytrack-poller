@@ -191,21 +191,19 @@ class GPS_Poller:
 
                 if sub_key == "GSV": # Multi-sequence packet
                     key += "-%s" % pkt.split(",")[2]
+                elif sub_key == "RMC": # Lat/Long "V" (Void) or "A" (Active)
+                    key += "-%s" % pkt.split(",")[2]
                 elif sub_key == "GLL": # Lat/Long "V" (Void) or "A" (Active)
-                    key += "-%s" % pkt.split(",")[-2]
+                    key += "-%s" % pkt.split(",")[6]
         except:
             pass
 
         self.state[key] = pkt
 
     def set_gps_time(self, new_time, source):
-        self.errlog("gps_time_" + source, "GPS Time {}: {} vs {}".format(source, new_time, time.localtime()))
+        self.errlog("gps_time_" + source, "GPS Time {}: {} RTC: {}".format(source, new_time, time.localtime()[:6]))
 
-        if None in new_time:
-            self.state["gps_time"] = (1969, 1, 1, 0, 0, 0)
-        else:
-            self.state["gps_time"] = new_time
-
+        if not None in new_time:
             if new_time[0] <= 2010: # No support for time travel
                 return
 
@@ -258,7 +256,10 @@ class GPS_Poller:
 
             if ll[3] == "W":
                 longitude *= -1
+
+            return (latitude, longitude)
         except:
+            self.errlog("parse_ll_fix_error", "Error parsing: {}".format(ll))
             return (None, None)
 
     def parse_rmc(self, pkt):
@@ -320,7 +321,6 @@ class GPS_Poller:
         try:
             fix_ll = self.parse_ll_fix(fields[1:4])
             fix_time = self.parse_gps_utc(fields[5])
-            self.set_gps_time((None, None, None) + fix_time, "gll")
             self.set_fix(fix_time, fix_ll, "gll")
         except:
             self.errlog("parse_gll_fail", "Failed to parse: " + pkt)
