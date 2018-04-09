@@ -28,7 +28,6 @@ class GPS_Poller:
         self.cmd_wait_for = None
         self.cmd_timeout = None
         self.time_mode = self.TIME_MODE_RTC
-        self.state["gps_time"] = (1969, 1, 1, 0, 0, 0)
         self.state["have_fix"] = False
 
         if time.localtime()[0] < 1981:
