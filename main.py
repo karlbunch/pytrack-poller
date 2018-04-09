@@ -199,14 +199,14 @@ class GPS_Poller:
         self.state[key] = pkt
 
     def set_gps_time(self, new_time, source):
-        self.errlog("gps_time", "GPS Time {}: {} vs {}".format(source, new_time, time.localtime()))
+        self.errlog("gps_time_" + source, "GPS Time {}: {} vs {}".format(source, new_time, time.localtime()))
 
         if None in new_time:
             self.state["gps_time"] = (1969, 1, 1, 0, 0, 0)
         else:
             self.state["gps_time"] = new_time
 
-            if new_time[0] <= 1980:
+            if new_time[0] <= 2010: # No support for time travel
                 return
 
             # Wait for cmd queue to drain
@@ -285,9 +285,11 @@ class GPS_Poller:
         try:
             fix_ll = self.parse_ll_fix(fields[3:6])
             ddmmyy = fields[9]
-            dd = int(ddmmyy[0:1])
-            mm = int(ddmmyy[2:3])
-            yy = 2000 + int(ddmmyy[4:5])
+            dd = int(ddmmyy[0:2])
+            mm = int(ddmmyy[2:4])
+            yy = int(ddmmyy[4:])
+            if yy < 100:
+                yy += 2000
             fix_time = self.parse_gps_utc(fields[1])
             self.set_gps_time((yy, mm, dd) + fix_time, "rmc")
             self.set_fix(fix_time, fix_ll, "rmc")
@@ -427,36 +429,41 @@ class gps_logger:
             except:
                 pass
 
+        if not self.have_SD:
+            print(">> No SD Card")
+
     def log(self, obj, stdout=False):
         tm = time.localtime()
         obj["time"] = "%04d-%02d-%02d %02d:%02d:%02d UTC" % tm[:6]
-        log_entry = json.dumps(obj) + "\n"
 
         if not self.have_SD:
-            return log_entry
+            obj["NOSDCARD"] = True
 
-        # YYYYMMDDHH
-        log_tag = tm[0] * 1000000 + tm[1] * 10000 + tm[2] * 100 + tm[3]
+        log_entry = json.dumps(obj) + "\n"
 
-        # Time for new file?
-        if self.log_tag != log_tag or not self.log_fh:
-            self.log_tag = log_tag
-            if self.log_fh:
-                self.log_fh.close()
-                self.log_fh = None
+        if self.have_SD:
+            # YYYYMMDDHH
+            log_tag = tm[0] * 1000000 + tm[1] * 10000 + tm[2] * 100 + tm[3]
 
-            log_fn = "/sd/gps-log-{}.json".format(self.log_tag)
-            try:
-                self.log_fh = open(log_fn, "a", encoding="ascii")
+            # Time for new file?
+            if self.log_tag != log_tag or not self.log_fh:
                 self.log_tag = log_tag
-                print("** Logging to %s" % log_fn)
-            except Exception as e:
-                sys.print_exception(e) # pylint: disable=E1101
-                print("** failed to open %s: No SD card?" % log_fn)
+                if self.log_fh:
+                    self.log_fh.close()
+                    self.log_fh = None
 
-        if self.log_fh:
-            self.log_fh.write(log_entry)
-            self.log_fh.flush()
+                log_fn = "/sd/gps-log-{}.json".format(self.log_tag)
+                try:
+                    self.log_fh = open(log_fn, "a", encoding="ascii")
+                    self.log_tag = log_tag
+                    print("** Logging to %s" % log_fn)
+                except Exception as e:
+                    sys.print_exception(e) # pylint: disable=E1101
+                    print("** failed to open %s: No SD card?" % log_fn)
+
+            if self.log_fh:
+                self.log_fh.write(log_entry)
+                self.log_fh.flush()
 
         if stdout:
             print(log_entry, end='', flush=True)
