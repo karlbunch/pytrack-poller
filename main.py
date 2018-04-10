@@ -7,10 +7,10 @@ import pytrack
 import gc
 import sys
 import os
-
-GPS_I2CADDR = const(0x10)
+import uio
 
 class GPS_Poller:
+    GPS_I2CADDR = 0x10
     TIME_MODE_RTC = "RTC"
     TIME_MODE_GPS_SEARCH = "GPS_SEARCH"
     TIME_MODE_GPS_INSYNC = "GPS_INSYNC"
@@ -33,6 +33,23 @@ class GPS_Poller:
         if time.localtime()[0] < 1981:
             self.time_mode = self.TIME_MODE_GPS_SEARCH
 
+    def __str__(self):
+        return self.__class__.__name__ + ":\n" + self.sorted_dict_str(self.__dict__)
+
+    def sorted_dict_str(self, src, indent=""):
+        buf = ""
+        for key in sorted(src):
+            val = src[key]
+
+            if isinstance(val, dict):
+                buf += "***{} {}:\n".format(indent, key)
+                buf += self.sorted_dict_str(val, indent=indent + "  ")
+            else:
+                buf += "***{} {}: {}\n".format(indent, key, val)
+
+        return buf
+
+    def run(self, log_interval=10):
         rtc = machine.RTC()
 
         try:
@@ -59,9 +76,55 @@ class GPS_Poller:
         self.queue_cmd("$PMTK301,2") # Enable SBAS DGPS Mode
         self.queue_cmd("$PMTK313,1") # Enable searching for SBAS satellites
 
-    def run(self, log_interval=10):
+        stop_reason = None
+
+        try:
+            self.run_loop(log_interval)
+        except KeyboardInterrupt as e:
+            stop_reason = e
+            print("** KeyboardInterrupt **")
+            pass
+        except Exception as e:
+            stop_reason = e
+            pass
+
+        print("** Stopping **")
+
+        stop_out = uio.StringIO()
+
+        print(">" * 80, file=stop_out)
+        print(" Stopped at " + str(time.localtime()[:6]), file=stop_out)
+        print("-" * 80, file=stop_out)
+
+        if stop_reason:
+            print("Exception: ", file=stop_out)
+            sys.print_exception(stop_reason, stop_out) # pylint: disable=E1101
+            print("-" * 80, file=stop_out)
+
+        print(str(self), end='', file=stop_out)
+        print("<" * 80, file=stop_out)
+
+        stop_msg = stop_out.getvalue()
+
+        try:
+            with open("/sd/stoplog.txt", "a+") as fh:
+                print(stop_msg, file=fh)
+        except:
+            pass
+
+        print(stop_msg)
+
+        try:
+            os.unmount("/sd") # pylint: disable=E1101
+            print("** Unmounted /sd")
+        except:
+            pass
+
+        print("** Stopped **")
+
+    def run_loop(self, log_interval=10):
         self.read_count = 0
-        self.next_log_time = 0
+        self.next_log_time = time.time() + log_interval
 
         circular_buffer = b""
         max_buf_len = 0
@@ -79,7 +142,7 @@ class GPS_Poller:
 
             pycom.rgbled(rgb_color)
 
-            buf = self.i2c.readfrom(GPS_I2CADDR, 255).lstrip(b"\n").rstrip(b"\n")
+            buf = self.i2c.readfrom(self.GPS_I2CADDR, 255).lstrip(b"\n").rstrip(b"\n")
 
             if len(buf) > max_buf_len:
                 max_buf_len = len(buf)
@@ -217,7 +280,7 @@ class GPS_Poller:
                     ss = new_time[-1]
                     rtc_tm = new_time[:-1] + (int(ss),int((ss-int(ss))*1000000))
                     machine.RTC().init(rtc_tm)
-                    self.errlog("rtc_set", "RTC set to {}".format(rtc_tm))
+                    self.errlog("rtc_set", "RTC set to {} because drift is {}".format(rtc_tm, self.state["clock_drift"]))
                 except:
                     pass
 
@@ -283,7 +346,7 @@ class GPS_Poller:
             return
 
         try:
-            fix_ll = self.parse_ll_fix(fields[3:6])
+            fix_ll = self.parse_ll_fix(fields[3:7])
             ddmmyy = fields[9]
             dd = int(ddmmyy[0:2])
             mm = int(ddmmyy[2:4])
@@ -318,7 +381,7 @@ class GPS_Poller:
             return
 
         try:
-            fix_ll = self.parse_ll_fix(fields[1:4])
+            fix_ll = self.parse_ll_fix(fields[1:5])
             fix_time = self.parse_gps_utc(fields[5])
             self.set_fix(fix_time, fix_ll, "gll")
         except:
@@ -368,7 +431,7 @@ class GPS_Poller:
 
         cmd += "*%02X\r\n" % chksum
 
-        self.i2c.writeto(GPS_I2CADDR, cmd.encode("ascii"))
+        self.i2c.writeto(self.GPS_I2CADDR, cmd.encode("ascii"))
 
         if wait_for == None: # By default expect a PMTK001,Cmd,3 (success)
             wait_for = "$PMTK001,%s,3" % cmd[5:8]
@@ -413,6 +476,7 @@ class gps_logger:
     def __init__(self):
         self.have_SD = False
         self.log_fh = None
+        self.log_fn = None
         self.log_tag = None
 
         try:
@@ -430,6 +494,10 @@ class gps_logger:
 
         if not self.have_SD:
             print(">> No SD Card")
+
+    def __str__(self):
+
+        return str(self.__dict__)
 
     def log(self, obj, stdout=False):
         tm = time.localtime()
@@ -451,14 +519,14 @@ class gps_logger:
                     self.log_fh.close()
                     self.log_fh = None
 
-                log_fn = "/sd/gps-log-{}.json".format(self.log_tag)
+                self.log_fn = "/sd/gps-log-{}.json".format(self.log_tag)
                 try:
-                    self.log_fh = open(log_fn, "a", encoding="ascii")
+                    self.log_fh = open(self.log_fn, "a", encoding="ascii")
                     self.log_tag = log_tag
-                    print("** Logging to %s" % log_fn)
+                    print("** Logging to %s" % self.log_fn)
                 except Exception as e:
                     sys.print_exception(e) # pylint: disable=E1101
-                    print("** failed to open %s: No SD card?" % log_fn)
+                    print("** failed to open %s: No SD card?" % self.log_fn)
 
             if self.log_fh:
                 self.log_fh.write(log_entry)
@@ -469,18 +537,5 @@ class gps_logger:
 
         return
 
-try:
-    poller = GPS_Poller(json_output=True)
-    poller.run()
-except:
-    pass
-
-print("** Stopped **")
-try:
-    import os
-    os.unmount("/sd") # pylint: disable=E1101
-except:
-    pass
-
-if poller:
-    print(poller.__dict__)
+if __name__ == "__main__":
+    GPS_Poller(json_output=True).run()
